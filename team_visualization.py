@@ -2,6 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import defaultdict
+import matplotlib.pyplot as plt
+import numpy as np
+import platform
+
+os = platform.system()
+
+# Windows
+if os == 'Windows':
+    plt.rc('font', family= 'Malgun Gothic')
 
 class TeamAssignmentNet(nn.Module):
     def __init__(self, num_participants, num_teams):
@@ -9,7 +18,6 @@ class TeamAssignmentNet(nn.Module):
         self.num_participants = num_participants
         self.num_teams = num_teams
         
-        # 참가자의 특성(성별, 실력)을 임베딩
         self.embedding = nn.Sequential(
             nn.Linear(3, 32),
             nn.ReLU(),
@@ -17,7 +25,6 @@ class TeamAssignmentNet(nn.Module):
             nn.ReLU()
         )
         
-        # 팀 할당 확률을 출력
         self.assignment = nn.Sequential(
             nn.Linear(64, num_teams),
             nn.Softmax(dim=1)
@@ -33,7 +40,6 @@ class TeamBalancer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def _prepare_data(self, participants):
-        """참가자 데이터를 텐서로 변환"""
         data = []
         for p in participants:
             gender_onehot = [1, 0] if p['gender'] == 'M' else [0, 1]
@@ -42,37 +48,72 @@ class TeamBalancer:
         return torch.tensor(data, dtype=torch.float32, device=self.device)
 
     def _calculate_balance_loss(self, assignments, features):
-        """팀 밸런스 손실 함수 계산"""
         team_sizes = torch.sum(assignments, dim=0)
         
-        # 1. 팀 크기 균형 (좀 더 유연하게 조정)
-        # 가장 큰 팀과 가장 작은 팀의 크기 차이를 최소화
         size_diff = torch.max(team_sizes) - torch.min(team_sizes)
         size_loss = size_diff ** 2
         
-        # 2. 실력 균형
         skills = features[:, 2].unsqueeze(1)
         team_skills = torch.mm(assignments.t(), skills)
-        # 팀별 평균 실력 계산
         team_avg_skills = team_skills / (team_sizes.unsqueeze(1) + 1e-6)
         skill_mean = torch.mean(team_avg_skills)
         skill_loss = torch.sum((team_avg_skills - skill_mean)**2)
         
-        # 3. 성별 균형
         genders = features[:, :2]
         team_genders = torch.mm(assignments.t(), genders)
-        # 팀별 성별 비율 계산
         team_gender_ratios = team_genders / (team_sizes.unsqueeze(1) + 1e-6)
         gender_mean = torch.mean(team_gender_ratios, dim=0)
         gender_loss = torch.sum((team_gender_ratios - gender_mean.unsqueeze(0))**2)
         
-        # 전체 손실 함수 (가중치 조정)
-        # 팀 크기 차이에 대한 페널티는 줄이고, 실력과 성별 균형에 더 중점
-        total_loss = size_loss * 2.0 + skill_loss * 2.0 + gender_loss * 2.0
+        total_loss = size_loss * 0.5 + skill_loss * 2.0 + gender_loss * 2.0
         return total_loss
 
+    def visualize_teams(self, team_stats):
+        """팀 구성 결과를 시각화"""
+        # 1. 팀별 평균 실력 그래프
+        plt.figure(figsize=(15, 10))
+        
+        # 1-1. 평균 실력 막대 그래프
+        plt.subplot(2, 2, 1)
+        team_names = [f'Team {i+1}' for i in range(self.num_teams)]
+        avg_skills = [stats['average_skill'] for stats in team_stats.values()]
+        plt.bar(team_names, avg_skills)
+        plt.title('팀별 평균 실력')
+        plt.ylim(0, 10)
+        plt.ylabel('평균 실력')
+        
+        # 1-2. 성별 분포 스택 바 차트
+        plt.subplot(2, 2, 2)
+        male_counts = [stats['gender_balance'].get('M', 0) for stats in team_stats.values()]
+        female_counts = [stats['gender_balance'].get('F', 0) for stats in team_stats.values()]
+        
+        width = 0.35
+        plt.bar(team_names, male_counts, width, label='남성')
+        plt.bar(team_names, female_counts, width, bottom=male_counts, label='여성')
+        plt.title('팀별 성별 분포')
+        plt.ylabel('인원 수')
+        plt.legend()
+        
+        # 1-3. 팀별 실력 분포 박스플롯
+        plt.subplot(2, 2, 3)
+        team_skills = []
+        for stats in team_stats.values():
+            team_skills.append([member['skill'] for member in stats['members']])
+        plt.boxplot(team_skills, labels=team_names)
+        plt.title('팀별 실력 분포')
+        plt.ylabel('실력')
+        
+        # 1-4. 팀별 인원수
+        plt.subplot(2, 2, 4)
+        team_sizes = [len(stats['members']) for stats in team_stats.values()]
+        plt.bar(team_names, team_sizes)
+        plt.title('팀별 인원수')
+        plt.ylabel('인원 수')
+        
+        plt.tight_layout()
+        plt.show()
+
     def create_balanced_teams(self, participants):
-        """최적의 팀 구성 생성"""
         features = self._prepare_data(participants)
         num_participants = len(participants)
         
@@ -82,14 +123,11 @@ class TeamBalancer:
         best_loss = float('inf')
         best_assignments = None
         
-        # 최적화 과정
         for epoch in range(1000):
             model.train()
             optimizer.zero_grad()
             
             assignment_probs = model(features)
-            
-            # Gumbel-Softmax trick
             temperature = max(0.5, 1.0 - epoch/1000)
             noise = -torch.log(-torch.log(torch.rand_like(assignment_probs)))
             assignments = torch.softmax((torch.log(assignment_probs) + noise) / temperature, dim=1)
@@ -105,15 +143,12 @@ class TeamBalancer:
             if epoch % 100 == 0 and best_loss < 0.1:
                 break
         
-        # 최종 팀 할당
         final_assignments = torch.argmax(best_assignments, dim=1).cpu().numpy()
         
-        # 결과 정리
         teams = {i: [] for i in range(self.num_teams)}
         for i, team_idx in enumerate(final_assignments):
             teams[team_idx.item()].append(participants[i])
             
-        # 팀 통계 계산
         team_stats = {}
         for team_id, members in teams.items():
             total_skill = sum(member['skill'] for member in members)
@@ -196,6 +231,9 @@ def main():
             for member in stats['members']:
                 print(f"    - {member['name']} (성별: {member['gender']}, "
                       f"실력: {member['skill']})")
+        
+        # 시각화 결과 표시
+        balancer.visualize_teams(balanced_teams)
     
     except Exception as e:
         print(f"\n오류: {e}")
